@@ -60,8 +60,10 @@ jobs:
         run: |
           mvn sonar:sonar \
             --batch-mode \
-            -Dproject.settings=sonar-project.properties \
-            -Dsonar.host.url=${{ vars.SONAR_HOST_URL }} \
+            -Dsonar.organization=gitops-final \
+            -Dsonar.projectKey=gitops-final \
+            -Dsonar.projectName=gitops-final \
+            -Dsonar.host.url=https://sonarcloud.io \
             -Dsonar.token=${{ secrets.SONAR_TOKEN }} \
             -Dsonar.qualitygate.wait=true
 
