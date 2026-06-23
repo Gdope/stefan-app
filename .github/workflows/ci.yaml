@@ -1,0 +1,225 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  # ──────────────────────────────────────────────────────────────────────────
+  # JOB 1 – Build, test, Checkstyle, SonarCloud  (PR to main only)
+  # ──────────────────────────────────────────────────────────────────────────
+  build-and-sonar:
+    name: Build, Test & SonarCloud Analysis
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0            # SonarCloud needs full history for blame
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: temurin
+
+      # ── Caching ────────────────────────────────────────────────────────────
+      - name: Cache Maven local repository
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
+          restore-keys: |
+            ${{ runner.os }}-maven-
+
+      - name: Cache SonarCloud packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.sonar/cache
+          key: ${{ runner.os }}-sonar
+          restore-keys: ${{ runner.os }}-sonar
+
+      # ── Build + unit tests ─────────────────────────────────────────────────
+      - name: Build and run unit tests
+        run: mvn clean test --batch-mode
+
+      # ── Checkstyle ─────────────────────────────────────────────────────────
+      - name: Run Checkstyle
+        run: mvn checkstyle:checkstyle --batch-mode
+
+      # ── SonarCloud analysis + quality gate ─────────────────────────────────
+      - name: SonarCloud analysis
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
+        run: |
+          mvn sonar:sonar \
+            --batch-mode \
+            -Dsonar.projectKey=$(grep '^sonar.projectKey' sonar-project.properties | cut -d'=' -f2) \
+            -Dsonar.projectName=$(grep '^sonar.projectName' sonar-project.properties | cut -d'=' -f2) \
+            -Dsonar.host.url=${{ vars.SONAR_HOST_URL }} \
+            -Dsonar.token=${{ secrets.SONAR_TOKEN }} \
+            -Dsonar.qualitygate.wait=true
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # JOB 2 – Docker build & push to ECR  (push to main only)
+  # ──────────────────────────────────────────────────────────────────────────
+  docker-build-push:
+    name: Docker Build & Push to ECR
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+
+    outputs:
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+      ecr_registry: ${{ steps.login-ecr.outputs.registry }}
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Derive image tag from commit SHA
+        id: meta
+        run: echo "image_tag=${GITHUB_SHA::8}" >> "$GITHUB_OUTPUT"
+
+      - name: Build Docker image
+        run: |
+          docker build \
+            -f Docker-files/app/Dockerfile \
+            -t ${{ steps.login-ecr.outputs.registry }}/${{ vars.ECR_REPOSITORY }}:${{ steps.meta.outputs.image_tag }} \
+            -t ${{ steps.login-ecr.outputs.registry }}/${{ vars.ECR_REPOSITORY }}:latest \
+            .
+
+      - name: Push Docker image (SHA tag + latest)
+        run: |
+          docker push ${{ steps.login-ecr.outputs.registry }}/${{ vars.ECR_REPOSITORY }}:${{ steps.meta.outputs.image_tag }}
+          docker push ${{ steps.login-ecr.outputs.registry }}/${{ vars.ECR_REPOSITORY }}:latest
+
+      - name: Notify Slack – image pushed
+        if: always()
+        uses: slackapi/slack-github-action@v1
+        with:
+          payload: |
+            {
+              "text": "*Docker image pushed* :docker:\nRepo: `${{ vars.ECR_REPOSITORY }}`\nTag: `${{ steps.meta.outputs.image_tag }}`\nStatus: `${{ job.status }}`\nWorkflow: <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View run>"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # JOB 3 – Update values.yaml in the Helm repo  (push to main only)
+  # ──────────────────────────────────────────────────────────────────────────
+  update-helm:
+    name: Update Helm values.yaml
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    needs: docker-build-push
+
+    outputs:
+      helm_branch: ${{ steps.branch.outputs.helm_branch }}
+
+    steps:
+      - name: Checkout Helm repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/${{ vars.HELM_REPO_NAME }}
+          token: ${{ secrets.GITOPS_PAT }}
+          path: helm-repo
+
+      - name: Install yq
+        run: |
+          wget -qO /usr/local/bin/yq \
+            https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+          chmod +x /usr/local/bin/yq
+
+      - name: Derive update branch name
+        id: branch
+        run: |
+          BRANCH="update-image-tag-${{ needs.docker-build-push.outputs.image_tag }}"
+          echo "helm_branch=${BRANCH}" >> "$GITHUB_OUTPUT"
+
+      - name: Create update branch in Helm repo
+        working-directory: helm-repo
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b ${{ steps.branch.outputs.helm_branch }}
+
+      - name: Update app.image and app.tag in values.yaml
+        working-directory: helm-repo
+        run: |
+          ECR_REGISTRY="${{ needs.docker-build-push.outputs.ecr_registry }}"
+          ECR_REPO="${{ vars.ECR_REPOSITORY }}"
+          IMAGE_TAG="${{ needs.docker-build-push.outputs.image_tag }}"
+
+          yq e ".app.image = \"${ECR_REGISTRY}/${ECR_REPO}\"" -i helm/stefan/values.yaml
+          yq e ".app.tag   = \"${IMAGE_TAG}\""                 -i helm/stefan/values.yaml
+
+      - name: Commit and push values.yaml update
+        working-directory: helm-repo
+        run: |
+          git add helm/stefan/values.yaml
+          git commit -m "chore: update image tag to ${{ needs.docker-build-push.outputs.image_tag }}"
+          git push origin ${{ steps.branch.outputs.helm_branch }}
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # JOB 4 – Open a Pull Request in the Helm repo  (push to main only)
+  # ──────────────────────────────────────────────────────────────────────────
+  open-pr:
+    name: Open PR in Helm Repo
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    needs: update-helm
+
+    steps:
+      - name: Open Pull Request via GitHub CLI
+        env:
+          GH_TOKEN: ${{ secrets.GITOPS_PAT }}
+        run: |
+          gh pr create \
+            --repo "${{ github.repository_owner }}/${{ vars.HELM_REPO_NAME }}" \
+            --base main \
+            --head "${{ needs.update-helm.outputs.helm_branch }}" \
+            --title "chore: deploy image tag ${{ needs.docker-build-push.outputs.image_tag }}" \
+            --body "## GitOps image update
+
+          Automated PR created by the **stefan-app** CI/CD pipeline.
+
+          | Field        | Value |
+          |---|---|
+          | ECR Registry | \`${{ needs.docker-build-push.outputs.ecr_registry }}\` |
+          | Repository   | \`${{ vars.ECR_REPOSITORY }}\` |
+          | Image tag    | \`${{ needs.docker-build-push.outputs.image_tag }}\` |
+          | Commit SHA   | \`${{ github.sha }}\` |
+          | Run          | [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) |
+
+          Merge this PR to apply the deployment."
+
+      - name: Notify Slack – PR opened
+        if: always()
+        uses: slackapi/slack-github-action@v1
+        with:
+          payload: |
+            {
+              "text": "*Helm PR opened* :git-pull-request:\nRepo: `${{ vars.HELM_REPO_NAME }}`\nBranch: `${{ needs.update-helm.outputs.helm_branch }}`\nStatus: `${{ job.status }}`\nWorkflow: <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View run>"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
